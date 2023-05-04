@@ -1,0 +1,403 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Dropout
+import time
+import krakenex
+from datetime import datetime, timedelta
+import mplfinance as mpf
+import ccxt
+import matplotlib.dates as mdates
+
+
+
+freq = 'D'
+
+
+k = krakenex.API()
+k.load_key('kraken.key')
+# Define the pair and interval for the data
+pair = 'XXBTZUSD'
+interval = 5  # in minutes
+current_time = datetime.now()
+interval_minutes = interval
+
+# Set the number of time steps for the LSTM model
+time_step = 60
+
+# Define the number of epochs and batch size for training
+epochs = 2 # Increase the number of epochs for better results
+batch_size = 64 # Increase the batch size if you get an out-of-memory error
+
+num_steps = 10
+# Define the number of time intervals to fetch data for
+num_intervals = 10  
+def unix_to_datetime(unix_timestamp):
+    return datetime.fromtimestamp(unix_timestamp)
+
+from tqdm import tqdm
+lookback_minutes = 5
+def fetch_data(pair, interval, num_intervals, lookback_minutes):
+    data = []
+    for i in tqdm(range(num_intervals), desc="Fetching data"):  # Add tqdm progress indicator
+        try:
+            response = k.query_public('OHLC', {'pair': pair, 'interval': interval})
+            ohlc = response['result'][pair]
+            df = pd.DataFrame(ohlc, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+            df = df.set_index('time')
+            data.append(df)
+            time.sleep(5)  # Reduce sleep duration to 2 seconds
+        except KeyError:
+            print(f"Error fetching data. API response: {response}")
+            print("Retrying in 2 seconds...")
+            time.sleep(5)  # Reduce sleep duration to 2 seconds
+    df = pd.concat(data)
+    df.index = pd.to_datetime(df.index, unit='s')
+    df = df.sort_index()
+    return df
+
+
+
+# Fetch data from the Kraken API
+df = fetch_data(pair, interval, num_intervals, lookback_minutes)
+
+# Convert the columns to the correct data type
+df = df[['open', 'high', 'low', 'close']].astype(float)
+
+
+
+
+def add_technical_indicators(df):
+    df['sma_short'] = df['close'].rolling(window=5).mean()
+    df['sma_long'] = df['close'].rolling(window=20).mean()
+    df = df.dropna()
+    return df
+
+# Preprocess the data
+def preprocess_data(df):
+    if df.empty:
+        print("Empty DataFrame in preprocess_data")
+        return None, None, None
+
+    df = add_technical_indicators(df)
+    scaler = MinMaxScaler()
+    df_scaled = scaler.fit_transform(df)
+    close_scaler = MinMaxScaler()
+    close_scaler.fit(df[['close']])
+    return df_scaled, scaler, close_scaler
+
+# Create the feature and label datasets
+def create_datasets(data, time_step):
+    X, y = [], []
+    for i in range(len(data) - time_step):
+        X.append(data[i:(i + time_step)])
+        y.append(data[i + time_step][3])  # 3 is the 'close' price column
+    return np.array(X), np.array(y)
+
+# Define the model architecture
+def build_model(time_step, num_features):
+    model = Sequential()
+    model.add(LSTM(units=50, return_sequences=True, input_shape=(time_step, num_features)))
+    model.add(Dropout(0.2))
+    model.add(LSTM(50, return_sequences=True))
+    model.add(Dropout(0.2))
+    model.add(LSTM(50))
+    model.add(Dropout(0.2))
+    model.add(Dense(1))
+    model.compile(loss='mean_squared_error', optimizer='adam')
+    print(model.summary())
+    return model
+
+# Preprocess the data
+df_scaled, scaler, close_scaler = preprocess_data(df)
+
+# Create the feature and label datasets
+X, y = create_datasets(df_scaled, time_step)
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Define the model architecture
+num_features = X_train.shape[2]
+model = build_model(time_step=60, num_features=num_features)
+
+# Train the model
+since_timestamp = int(current_time.timestamp()) - (time_step * interval_minutes * 60 * 5)
+start_time = time.time()
+history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=epochs, batch_size=batch_size, verbose=2)
+print("Training time:", time.time() - start_time, "seconds")
+
+# Evaluate the model
+train_loss = model.evaluate(X_train, y_train, verbose=0)
+test_loss = model.evaluate(X_test, y_test, verbose=0)
+print(f'Train loss: {train_loss:.4f}, Test loss: {test_loss:.4f}')
+
+def future_price(model, input_data, time_step, num_future_steps):
+    future_prices = []
+    for i in range(num_future_steps):
+        prediction = model.predict(input_data)
+        future_prices.append(prediction)
+        new_input = np.zeros((1, input_data.shape[1], input_data.shape[2]))
+        new_input[:, :-1, :] = input_data[:, 1:, :]
+        new_input[:, -1, :3] = input_data[:, -1, :3]
+        new_input[:, -1, 3] = prediction
+        input_data = new_input
+    return np.array(future_prices)
+
+
+
+
+
+# Make predictions
+# #predictions = model.predict(X_test)
+
+# Make predictions
+predictions = model.predict(X)
+
+
+
+# Print the future prices
+#print("Future prices:", future_prices)
+
+
+
+def inverse_scale(scaler, predictions):
+    # Create a dummy array with the same shape as predictions
+    dummy = np.zeros((len(predictions), scaler.scale_.shape[0]))
+
+    # Replace the 'close' price column with the predictions
+    dummy[:, 3] = predictions[:, 0]
+
+    # Inverse scale the dummy array
+    inverted = scaler.inverse_transform(dummy)
+
+    # Return the 'close' price column
+    return inverted[:, 3]
+# Make future predictions
+num_future_steps = 10
+future_predictions = future_price(model, X[-1].reshape(1, -1, X.shape[-1]), time_step, num_future_steps)
+future_predictions = future_predictions.reshape(-1, 1)
+
+#def predict_future_prices(model, scaled_data, start_time, num_steps, interval_minutes, close_scaler):
+def predict_future_prices(model, df, scaled_data, start_time, num_steps, interval_minutes):
+
+    start_time = datetime.fromtimestamp(start_time)
+    end_time = start_time + timedelta(minutes=num_steps * interval_minutes)
+    historical_data_length_seconds = num_steps * interval_minutes * 60
+    since_timestamp = int(start_time.timestamp()) - historical_data_length_seconds
+    time.sleep(2)
+    response = k.query_public('OHLC', {'pair': pair, 'interval': interval, 'since': since_timestamp})
+
+    if 'result' not in response:
+        print(f"No data available for prediction")
+        return []
+
+    time_range = [start_time + timedelta(minutes=i * interval_minutes) for i in range(num_steps)]
+
+    future_prices = []
+    future_price_series = pd.Series(dtype=float, index=pd.DatetimeIndex([], name="time"))
+
+    for i in range(num_steps):
+        current_time = time_range[i]
+
+        since_timestamp = int(current_time.timestamp()) - (time_step * interval_minutes * 60)
+        response = k.query_public('OHLC', {'pair': pair, 'interval': interval, 'since': since_timestamp})
+
+        if 'result' not in response or len(response['result'][pair]) < time_step:
+            print(f"Not enough data available for prediction at step {i}")
+            future_prices.append(None)
+            continue
+
+        history = response['result'][pair]
+
+        df = pd.DataFrame(history, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        df = df.set_index('time')
+        df.index = pd.to_datetime(df.index, unit='s')
+        df = df[['close']]
+
+        scaled_data, _, _ = preprocess_data(df)
+
+        if scaled_data is None:
+            print(f"No data available for prediction at step {i}")
+            future_prices.append(None)
+            continue
+
+        #X_future, _ = create_datasets(scaled_data, time_step)
+        #X_future = X_future.reshape((1, time_step, 1))
+
+        X_future, _ = create_datasets(scaled_data, time_step)
+
+        if X_future.size == 0:
+            print(f"Not enough data available for prediction at step {i}")
+            future_prices.append(None)
+            continue
+
+        X_future = X_future.reshape((1, time_step, 1))
+
+
+
+        predicted_price = model.predict(X_future)[-1][0]
+
+        close_scaler = MinMaxScaler()
+        close_scaler.fit(df.values)
+
+        predicted_price_unscaled = close_scaler.inverse_transform([[predicted_price]])[0][0]
+        future_prices.append(predicted_price_unscaled)
+
+        datetime_index = time_range
+        future_price_series = pd.Series(future_prices, index=datetime_index)
+
+    return future_price_series.dropna()
+
+
+
+
+
+
+
+def get_current_price():
+    exchange = ccxt.kraken()
+    trading_pair = 'BTC/USD'  # Replace with your desired trading pair
+    ticker = exchange.fetch_ticker(trading_pair)
+    current_price = ticker['ask']
+    return current_price
+
+def predict_signal(model, k, start_time, num_steps, interval_minutes, close_scaler):
+    future_prices = predict_future_prices(model, k, start_time, num_steps, interval_minutes, close_scaler)
+    current_price = get_current_price()
+    
+    if future_prices[0][0] > current_price:
+        return "Buy"
+    else:
+        return "Sell"
+
+
+# Inverse scale the predictions and actual prices
+predictions_inverse = inverse_scale(scaler, predictions.reshape(-1, 1))
+y_test_inverse = inverse_scale(scaler, y_test.reshape(-1, 1))
+
+# Get the corresponding timestamps for the test dataset
+timestamps = df.iloc[-len(y_test):].index
+
+# Plot the historical data with test predictions
+#future_price_series = predict_future_prices(model, df, df_scaled, start_time, num_steps, interval_minutes, close_scaler)
+future_price_series = predict_future_prices(model, df, df_scaled, start_time, num_steps, interval_minutes)
+
+
+
+
+num_steps = 23
+interval_minutes = 15
+
+start_time = pd.to_datetime('2023-05-01 15:00:00').timestamp()
+#future_price_series = predict_future_prices(model, k, start_time, num_steps, interval_minutes, close_scaler)
+#future_price_series = predict_future_prices(model, scaled_data, inversed_data, start_time, num_steps, interval_minutes, close_scaler, time_column)
+#future_price_series = predict_future_prices(model, df_scaled, start_time, num_steps, interval_minutes, close_scaler)
+#future_price_series = predict_future_prices(model, df, df_scaled, start_time, num_steps, interval_minutes, close_scaler)
+
+#future_timestamps = pd.date_range(start=df.index[-1], periods=num_steps, freq=f'{interval_minutes}T')[1:]
+future_timestamps = pd.date_range(start=since_timestamp, periods=len(future_price_series.values) + 1, freq=freq)[1:]
+
+
+
+predicted_prices_df = pd.DataFrame(future_price_series.values, columns=['Predicted_Price'], index=future_timestamps)
+
+
+df = df.loc[~df.index.duplicated(keep='first')]
+predicted_prices_df = predicted_prices_df.loc[~predicted_prices_df.index.duplicated(keep='first')]
+
+#combined_df = pd.concat([df['close'], predicted_prices_df['Predicted_Price']], axis=1)
+
+
+
+
+
+
+#combined_df = pd.concat([df['close'], predicted_prices_df['Predicted_Price']], axis=1)
+
+
+
+
+
+
+
+predicted_prices_df = pd.DataFrame(future_price_series.values, columns=['Predicted_Price'], index=future_timestamps)
+
+
+# 1. Reset the index of the historical prices dataframe
+historical_prices_df = df[['close']].reset_index(drop=True)
+
+# 2. Concatenate the historical prices dataframe with the future predictions dataframe
+#combined_df = pd.concat([historical_prices_df, predicted_prices_df.reset_index(drop=True)], axis=1)
+# Concatenate the historical prices dataframe with the future predictions dataframe
+combined_df = pd.concat([df['close'], predicted_prices_df['Predicted_Price']], axis=1)
+
+# Create a new DatetimeIndex for the concatenated dataframe
+new_index = pd.date_range(start=df.index[0], periods=len(combined_df), freq=f'{interval_minutes}T')
+combined_df.index = new_index
+
+
+
+
+
+
+
+# Plot the historical data with test predictions
+# Predict future prices
+# Call the predict_future_prices function to get future price predictions
+start_time = pd.to_datetime('2023-05-01 15:00:00').timestamp()
+#future_price_series = predict_future_prices(model, k, start_time, num_steps, interval_minutes, close_scaler)
+
+n_predictions = len(future_price_series)
+
+
+last_timestamp = df.index[-1]  # Last timestamp in the historical data
+freq = '15T'  # Assuming the data has 15-minute intervals
+
+future_timestamps = pd.date_range(start=last_timestamp, periods=n_predictions, freq=freq)[1:]
+
+#future_timestamps = pd.date_range(start=last_timestamp, periods=len(future_predictions) + 1, freq=freq)[1:]
+future_price_series_array = np.array(future_price_series)
+print("Future predictions shape (NumPy array):", future_price_series_array.shape)
+#print("Future predictions shape:", future_price_series.shape)
+#   print("Future timestamps shape:", len(future_timestamps))
+
+#future_price_series = future_price_series[:-1]
+
+
+# Calculate the number of predictions
+
+
+
+#future_predictions = predict_future_prices(model, k, start_time, num_steps, interval_minutes, close_scaler)
+
+# Plot the historical data with test predictions
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+# ... (rest of the plotting code remains unchanged)
+
+# Plot the future projections
+# Plot the future projections
+index_array = range(len(future_price_series))
+
+if len(future_price_series) > 0:
+    last_time = df.index[-1]
+    #future_time_index = [last_time + datetime.timedelta(minutes=interval_minutes * i) for i in range(1, len(future_price_series) + 1)]
+    future_time_index = [last_time + timedelta(minutes=interval_minutes * i) for i in range(1, len(future_price_series) + 1)]
+
+    ax2.plot(future_time_index, future_price_series, label='Projected Price', color='red')
+else:
+    print("No data available for plotting future prices.")
+
+print("df.index:", df.index)
+print("df['close']:", df['close'])
+
+ax2.set_title('Future Projections')
+ax2.legend()
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+
+plt.tight_layout()
+plt.show()
