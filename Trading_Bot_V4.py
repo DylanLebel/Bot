@@ -29,12 +29,12 @@ interval_minutes = interval
 time_step = 60
 
 # Define the number of epochs and batch size for training
-epochs = 2 # Increase the number of epochs for better results
+epochs = 5 # Increase the number of epochs for better results
 batch_size = 64 # Increase the batch size if you get an out-of-memory error
 
 num_steps = 10
 # Define the number of time intervals to fetch data for
-num_intervals = 10  
+num_intervals = 150 
 def unix_to_datetime(unix_timestamp):
     return datetime.fromtimestamp(unix_timestamp)
 
@@ -144,7 +144,9 @@ def future_price(model, input_data, time_step, num_future_steps):
         new_input[:, :-1, :] = input_data[:, 1:, :]
         new_input[:, -1, :3] = input_data[:, -1, :3]
         new_input[:, -1, 3] = prediction
-        input_data = new_input
+        input_data = new_input.reshape(1, time_step, num_features)
+
+        # input_data = new_input
     return np.array(future_prices)
 
 
@@ -178,9 +180,16 @@ def inverse_scale(scaler, predictions):
     return inverted[:, 3]
 # Make future predictions
 num_future_steps = 10
-future_predictions = future_price(model, X[-1].reshape(1, -1, X.shape[-1]), time_step, num_future_steps)
-future_predictions = future_predictions.reshape(-1, 1)
+#future_predictions = future_price(model, X[-1].reshape(1, -1, X.shape[-1]), time_step, num_future_steps)
+#future_predictions = future_predictions.reshape(-1, 1
+future_predictions = model.predict(X_test)
 
+
+future_predictions = np.squeeze(future_predictions)  # Remove the extra dimension
+#future_prices = scaler.inverse_transform(future_predictions.reshape(-1, 1))
+future_prices = close_scaler.inverse_transform(future_predictions.reshape(-1, 1))
+
+print("Future prices:", future_prices)
 #def predict_future_prices(model, scaled_data, start_time, num_steps, interval_minutes, close_scaler):
 def predict_future_prices(model, df, scaled_data, start_time, num_steps, interval_minutes):
 
@@ -383,6 +392,23 @@ fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
 # Plot the future projections
 index_array = range(len(future_price_series))
 
+# Plot historical prices
+plt.plot(df.index, df["close"], label="Historical Prices")
+
+# Plot future prices
+#future_timestamps = pd.date_range(df.index[-1] + pd.Timedelta(minutes=interval_minutes), periods=len(future_prices), closed="right", freq=f"{interval_minutes}T")
+future_timestamps = pd.date_range(df.index[-1] + pd.Timedelta(minutes=interval_minutes), periods=len(future_prices) + 1, freq=f"{interval_minutes}T")[1:]
+
+
+plt.plot(future_timestamps, future_prices, label="Future Prices", linestyle="--")
+
+# Customize the plot
+plt.title("Historical and Future Prices")
+plt.xlabel("Time")
+plt.ylabel("Price")
+plt.legend()
+plt.show()
+"""
 if len(future_price_series) > 0:
     last_time = df.index[-1]
     #future_time_index = [last_time + datetime.timedelta(minutes=interval_minutes * i) for i in range(1, len(future_price_series) + 1)]
@@ -401,3 +427,4 @@ ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
 
 plt.tight_layout()
 plt.show()
+"""
