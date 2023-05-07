@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import mplfinance as mpf
 import ccxt
 import matplotlib.dates as mdates
-
+from requests.exceptions import RequestException
 
 
 freq = 'D'
@@ -198,7 +198,22 @@ def predict_future_prices(model, df, scaled_data, start_time, num_steps, interva
     historical_data_length_seconds = num_steps * interval_minutes * 60
     since_timestamp = int(start_time.timestamp()) - historical_data_length_seconds
     time.sleep(2)
-    response = k.query_public('OHLC', {'pair': pair, 'interval': interval, 'since': since_timestamp})
+
+    max_retries = 5
+    sleep_time = 5
+    for attempt in range(max_retries):
+        try:
+            response = k.query_public('OHLC', {'pair': pair, 'interval': interval, 'since': since_timestamp})
+            break
+        except RequestException as e:
+            if attempt < max_retries - 1:
+                print(f"Error encountered while fetching data: {e}. Retrying... (attempt {attempt + 1})")
+                time.sleep(sleep_time)
+            else:
+                raise Exception("Failed to fetch data from Kraken API after multiple retries.")
+
+
+    #response = k.query_public('OHLC', {'pair': pair, 'interval': interval, 'since': since_timestamp})
 
     if 'result' not in response:
         print(f"No data available for prediction")
