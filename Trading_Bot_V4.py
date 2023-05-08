@@ -12,9 +12,10 @@ import mplfinance as mpf
 import ccxt
 import matplotlib.dates as mdates
 from requests.exceptions import RequestException
+import concurrent.futures
 
 
-freq = 'D'
+freq = '4H'
 
 
 k = krakenex.API()
@@ -40,27 +41,44 @@ def unix_to_datetime(unix_timestamp):
 
 from tqdm import tqdm
 lookback_minutes = 5
-def fetch_data(pair, interval, num_intervals, lookback_minutes):
+def fetch_data_async(pair, interval, num_intervals, lookback_minutes):
+def fetch_data(pair, interval, num_intervals, lookback_minutes, max_retries=3):
     data = []
     for i in tqdm(range(num_intervals), desc="Fetching data"):  # Add tqdm progress indicator
-        try:
-            response = k.query_public('OHLC', {'pair': pair, 'interval': interval})
-            ohlc = response['result'][pair]
-            df = pd.DataFrame(ohlc, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
-            df = df.set_index('time')
-            data.append(df)
-            time.sleep(5)  # Reduce sleep duration to 2 seconds
-        except KeyError:
-            print(f"Error fetching data. API response: {response}")
-            print("Retrying in 2 seconds...")
-            time.sleep(5)  # Reduce sleep duration to 2 seconds
+        for attempt in range(max_retries):
+            try:
+                response = k.query_public('OHLC', {'pair': pair, 'interval': interval})
+                ohlc = response['result'][pair]
+                df = pd.DataFrame(ohlc, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+                df = df.set_index('time')
+                data.append(df)
+                time.sleep(5)  # Reduce sleep duration to 2 seconds
+                break  # Break the retry loop if successful
+            except (KeyError, RequestException) as e:
+                print(f"Error fetching data (attempt {attempt + 1}): {e}")
+                print("API response:", response)
+                if attempt < max_retries - 1:
+                    print("Retrying in 2 seconds...")
+                    time.sleep(2)  # Reduce sleep duration to 2 seconds
+                else:
+                    print("Skipping this interval.")
     df = pd.concat(data)
     df.index = pd.to_datetime(df.index, unit='s')
     df = df.sort_index()
     return df
-
-
-
+    pass
+def fetch_data_parallel(pair, interval, num_intervals, lookback_minutes, num_threads=4):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [executor.submit(fetch_data_async, pair, interval, num_intervals, lookback_minutes) for _ in range(num_threads)]
+        
+        results = []
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results.append(result)
+            
+        # Combine results from all threads and return a single dataframe
+        combined_df = pd.concat(results)
+        return combined_df
 # Fetch data from the Kraken API
 df = fetch_data(pair, interval, num_intervals, lookback_minutes)
 
